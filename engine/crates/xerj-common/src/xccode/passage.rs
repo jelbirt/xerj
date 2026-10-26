@@ -168,10 +168,12 @@ pub fn symbol_passage(
             )
         } else {
             // The offset is into the definition, so the label's start line
-            // (and every citation built from it) is unchanged.
+            // (and every citation built from it) is unchanged. The marker
+            // trails the window, as the truncation marker does, so a budget
+            // that cuts from the end drops the marker before any code.
             format!(
-                "    ... [{kind} {name}: showing {} of {} chars from offset {}, \
-                 window centred on the match]\n{window}",
+                "{window}\n    ... [{kind} {name}: showing {} of {} chars from offset {}, \
+                 window centred on the match]",
                 commaus(py_len(&window)),
                 commaus(total),
                 commaus(offset)
@@ -861,7 +863,13 @@ mod tests {
         assert_eq!(label, "function long_function @ line 3");
         assert!(text.contains("Localize a naive timestamp"), "{text}");
         assert!(!text.contains("def long_function"), "not the head: {text}");
-        let (marker, window) = text.split_once('\n').unwrap();
+        let (window, marker) = text.rsplit_once('\n').unwrap();
+        // The window comes first, so a cut from the end loses the marker
+        // before the match.
+        assert!(
+            take_chars(&text, 300).contains("Localize a naive timestamp"),
+            "{text}"
+        );
         let prefix = "    ... [function long_function: showing ";
         assert!(marker.starts_with(prefix), "{marker}");
         assert!(
