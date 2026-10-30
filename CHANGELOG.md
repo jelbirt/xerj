@@ -194,6 +194,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is the index name before the dataset slug", which read as a wrong `--prefix`
   (#2670).
 
+- `xerj autoindex` reads a spreadsheet sheet with no header row and no text,
+  such as an all-numbers export, as a table: one record per row, columns named
+  `col_A`, `col_B` and so on, values kept as numbers, booleans and dates. It
+  used to index such a sheet as one text document, which the 4,096-section cap
+  cut off: a 200,000-row sheet kept rows up to 72,724. Sheets with any text
+  cell, uneven rows or one column are still indexed as documents (#2720).
+
 ## [1.0.0-rc.100] - 2026-10-26
 
 **rc.100: faster autoindex and search, shaped by your field reports.** This
