@@ -86,6 +86,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--skills`, and the recipe `docs/recipes/find-a-skill.md` uses it. Part of
   #2644.
 
+- `bash scripts/bench/skills-intent.sh` is the eval #2644 asks for: it installs
+  388 skills from a pinned MIT library into a throwaway home, runs
+  `xerj autoindex --skills`, and ranks the right skill for 26 labelled task
+  queries written blind. On 2026-10-31 the right skill was first for 13 and in
+  the top 3 for 22; every rank, misses included, is in
+  `benchmarks/skills-intent/results/`. Part of #2644.
+
 ### Fixed
 
 - Code-extraction size skips now report exact file/limit byte counts and
