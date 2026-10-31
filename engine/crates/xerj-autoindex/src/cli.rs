@@ -263,6 +263,9 @@ pub enum Cmd {
     /// variants, so inlining it made every `Cmd` — including `Help` — pay for
     /// it (`clippy::large_enum_variant`).
     Index(Box<IndexCfg>),
+    /// `--skills` (#2644): the flags for one run, with no folder yet. Each
+    /// skill folder found gets its own root and prefix in [`crate::skills`].
+    Skills(Box<IndexCfg>),
     Map(MapCfg),
     Status(StatusCfg),
     Remove(RemoveCfg),
@@ -314,6 +317,13 @@ pub fn help_text_with(feedback: bool) -> String {
          {feedback_block}\
          USAGE:\n\
          \x20\x20\x20\x20xerj autoindex <folder> [OPTIONS]     discover + index a folder\n\
+         \x20\x20\x20\x20xerj autoindex --skills [OPTIONS]     find the agent skill folders that exist\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20(~/.claude/skills, ~/.codex/skills,\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20~/.agents/skills, ./.claude/skills) and\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20index each under its own prefix: <P>-claude,\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<P>-codex, <P>-agents, <P>-project (P is\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20--prefix, default skills). Search them all\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20with `xerj search --prefix skills`\n\
          \x20\x20\x20\x20xerj autoindex s3://<bucket>/<prefix> [OPTIONS]\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20discover + index objects in a bucket\n\
          \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20(r2:// too; see OBJECT STORAGE)\n\
@@ -961,6 +971,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
     let mut replace_prefix = false;
     let mut prefix_explicit = false;
     let mut prefix_given: Option<String> = None;
+    let mut skills = false;
     let mut state_dir: Option<PathBuf> = None;
     let mut endpoint_url: Option<String> = None;
     let mut endpoint_explicit = false;
@@ -1112,6 +1123,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 prefix_given = Some(prefix.clone());
             }
             "--replace-prefix" => replace_prefix = true,
+            "--skills" => skills = true,
             "--state-dir" => state_dir = it.next().map(PathBuf::from),
             "--endpoint-url" => {
                 let value = it.next().ok_or(
@@ -1499,6 +1511,41 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             }
             other => return Err(format!("unknown argument: {other}")),
         }
+    }
+
+    // #2644: `--skills` names its own folders (crate::skills), so it takes
+    // none, and each folder keeps its own resume journal.
+    if skills {
+        if let Some(sub) = &sub {
+            return Err(format!(
+                "--skills indexes the skill folders it finds; it does not apply to \
+                 `autoindex {sub}`"
+            ));
+        }
+        if let Some(raw) = &root_raw {
+            return Err(format!(
+                "--skills finds the skill folders itself and takes no folder, got `{raw}`. \
+                 Index that folder on its own with `xerj autoindex {raw} --prefix <name>`"
+            ));
+        }
+        if state_dir.is_some() {
+            return Err(
+                "--state-dir names one folder's resume journal, and --skills indexes \
+                 each skill folder with its own. Drop --state-dir"
+                    .into(),
+            );
+        }
+        if json {
+            return Err(
+                "--json prints one document per run, and --skills runs once per skill \
+                 folder. Drop --json: each run still ends with its own `xerj-done` line"
+                    .into(),
+            );
+        }
+        if !prefix_explicit {
+            prefix = "skills".into();
+        }
+        folder = Some(PathBuf::new());
     }
 
     if report_output.is_some() || redact_paths {
@@ -2151,7 +2198,7 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 );
             }
             let plan = crate::resources::plan(workers, pdf_workers, bulk_mb);
-            Ok(Cmd::Index(Box::new(IndexCfg {
+            let cfg = Box::new(IndexCfg {
                 root,
                 endpoint_url,
                 url,
@@ -2213,7 +2260,12 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
                 exclude_rels: Vec::new(),
                 exclude: exclude_globs,
                 skip_corpus_data: false,
-            })))
+            });
+            Ok(if skills {
+                Cmd::Skills(cfg)
+            } else {
+                Cmd::Index(cfg)
+            })
         }
         // No folder and no subcommand. This used to print the full help and
         // exit 0, so a bare `xerj autoindex` looked like a successful run.
@@ -2746,6 +2798,55 @@ mod tests {
 
     fn err(args: &[&str]) -> String {
         parse(args.iter().map(|s| s.to_string()).collect()).expect_err("must be refused")
+    }
+
+    fn skills(args: &[&str]) -> super::IndexCfg {
+        match parse(args.iter().map(|s| s.to_string()).collect()) {
+            Ok(Cmd::Skills(cfg)) => *cfg,
+            other => panic!("expected the --skills route, got {other:?}"),
+        }
+    }
+
+    /// #2644: `--skills` finds the folders itself, and `skills` is the stem
+    /// the prefixes hang from unless `--prefix` names another.
+    #[test]
+    fn skills_takes_no_folder_and_skills_is_the_default_stem() {
+        assert_eq!(skills(&["--skills"]).prefix, "skills");
+        assert_eq!(skills(&["--skills", "--prefix", "team"]).prefix, "team");
+        let cfg = skills(&[
+            "--skills",
+            "--watch",
+            "--no-graph",
+            "--url",
+            "http://x:9200",
+        ]);
+        assert!(cfg.watch);
+        assert_eq!(cfg.url, "http://x:9200");
+    }
+
+    /// A folder, a shared state directory or a subcommand would each be
+    /// silently dropped or shared between folders, so each is refused.
+    #[test]
+    fn skills_refuses_a_folder_a_state_dir_and_a_subcommand() {
+        assert!(err(&["--skills", "docs"]).contains("--skills"));
+        assert!(err(&["docs", "--skills"]).contains("--skills"));
+        assert!(err(&["--skills", "s3://b/"]).contains("--skills"));
+        assert!(err(&["--skills", "--state-dir", "/s"]).contains("--state-dir"));
+        assert!(err(&["map", "--skills"]).contains("--skills"));
+        assert!(err(&["status", "--skills"]).contains("--skills"));
+    }
+
+    /// Each folder's run prints its own JSON document, so `--json` would put
+    /// several documents on one stdout; it is refused instead.
+    #[test]
+    fn skills_refuses_json() {
+        assert!(err(&["--skills", "--json"]).contains("--json"));
+    }
+
+    #[test]
+    fn the_help_documents_skills() {
+        let help = super::help_text_with(false);
+        assert!(help.contains("xerj autoindex --skills"), "{help}");
     }
 
     /// The `--watch` refusal must name the limitation it actually has.

@@ -278,6 +278,86 @@ fn parse_time(raw: &str) -> Option<SystemTime> {
     Some(SystemTime::UNIX_EPOCH + Duration::new(secs as u64, dt.timestamp_subsec_nanos()))
 }
 
+/// The root of the latest run of `prefix` and of every longer `prefix-...`
+/// catalog prefix, keyed by catalog prefix (#2644).
+pub fn folder_roots(runs: &[Value], prefix: &str) -> std::collections::BTreeMap<String, String> {
+    let sibling = format!("{prefix}-");
+    let names: std::collections::BTreeSet<&str> = runs
+        .iter()
+        .filter_map(|run| field_str(run, "prefix"))
+        .filter(|p| *p == prefix || p.starts_with(&sibling))
+        .collect();
+    names
+        .into_iter()
+        .filter_map(|p| latest_stamp(runs, p).map(|stamp| (p.to_string(), stamp.root)))
+        .collect()
+}
+
+/// [`folder_roots`] read from the catalog on `url`. `None` on any failure;
+/// the caller then prints paths as it always did.
+pub fn fetch_folder_roots(
+    url: &str,
+    api_key: Option<&str>,
+    prefix: &str,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let prefix = prefix.trim();
+    let url = url.trim().trim_end_matches('/');
+    if prefix.is_empty() || url.is_empty() {
+        return None;
+    }
+    let client = CatalogClient::new(url, api_key)?;
+    let source = json!([
+        "prefix",
+        "root",
+        "started",
+        "summary_generated_at",
+        "run_id",
+        "doc_kind"
+    ]);
+    let query = folder_roots_query(prefix);
+    let body = json!({"size": 200, "sort": [{"_id": "desc"}], "_source": source, "query": query});
+    let runs = match client.search(&body) {
+        Ok(found) => hit_sources(&found),
+        Err(CatalogErr::BadRequest) => {
+            let unsorted = json!({"size": 200, "_source": source, "query": query});
+            hit_sources(&client.search(&unsorted).ok()?)
+        }
+        Err(CatalogErr::Failed) => return None,
+    };
+    Some(folder_roots(&runs, prefix))
+}
+
+/// The catalog runs [`folder_roots`] reads: `prefix` and every `prefix-...`.
+pub fn folder_roots_query(prefix: &str) -> Value {
+    json!({"bool": {
+        "must": [{"term": {"doc_kind": "run"}}],
+        "should": [
+            {"term": {"prefix": prefix}},
+            {"prefix": {"prefix": format!("{prefix}-")}},
+            // An older catalog maps `prefix` as text (see scope_clause).
+            {"match_phrase": {"prefix": prefix}}
+        ],
+        "minimum_should_match": 1
+    }})
+}
+
+/// The folder an index was built from: the root of the longest catalog
+/// prefix `p` in `roots` whose `p-` starts the index name.
+pub fn root_of_index<'a>(
+    roots: &'a std::collections::BTreeMap<String, String>,
+    index: &str,
+) -> Option<&'a str> {
+    roots
+        .iter()
+        .filter(|(p, _)| {
+            index
+                .strip_prefix(p.as_str())
+                .is_some_and(|rest| rest.starts_with('-'))
+        })
+        .max_by_key(|(p, _)| p.len())
+        .map(|(_, root)| root.as_str())
+}
+
 fn scope_matches(doc: &Value, prefix: &str) -> bool {
     field_str(doc, "prefix") == Some(prefix) || field_str(doc, CORPUS_SCOPE_FIELD) == Some(prefix)
 }
@@ -699,6 +779,70 @@ fn hit_sources(body: &Value) -> Vec<Value> {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn run_doc(prefix: &str, root: &str, started: &str) -> Value {
+        json!({"doc_kind": "run", "prefix": prefix, "root": root, "started": started})
+    }
+
+    /// #2644: `--prefix skills` searches `skills-*`, which spans one folder
+    /// per `skills-<label>` prefix. Each keeps the root of its latest run;
+    /// a prefix that only shares the letters (`skillsx`) is not one of them.
+    #[test]
+    fn folder_roots_keeps_the_latest_root_of_each_sibling_prefix() {
+        let runs = vec![
+            run_doc("skills-codex", "/old/.codex/skills", "2026-10-01T00:00:00Z"),
+            run_doc("skills-claude", "/h/.claude/skills", "2026-10-30T00:00:00Z"),
+            run_doc("skills-codex", "/h/.codex/skills", "2026-10-30T00:00:00Z"),
+            run_doc("skillsx", "/x", "2026-10-30T00:00:00Z"),
+            run_doc("other", "/o", "2026-10-30T00:00:00Z"),
+        ];
+        let roots = folder_roots(&runs, "skills");
+        let got: Vec<(&str, &str)> = roots
+            .iter()
+            .map(|(p, r)| (p.as_str(), r.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("skills-claude", "/h/.claude/skills"),
+                ("skills-codex", "/h/.codex/skills"),
+            ]
+        );
+        assert_eq!(
+            root_of_index(&roots, "skills-codex-docs"),
+            Some("/h/.codex/skills")
+        );
+        assert_eq!(
+            root_of_index(&roots, "skills-claude-cowork-docx"),
+            Some("/h/.claude/skills")
+        );
+        assert_eq!(root_of_index(&roots, "skills-docs"), None);
+    }
+
+    /// An older catalog maps `prefix` as text, where neither `term` nor
+    /// `prefix` matches a whole `skills-claude`; `match_phrase` does, as in
+    /// [`scope_clause`]. [`folder_roots`] then keeps only real siblings.
+    #[test]
+    fn the_folder_lookup_also_reads_a_text_mapped_prefix() {
+        let q = folder_roots_query("skills");
+        let should = q.pointer("/bool/should").and_then(Value::as_array).unwrap();
+        assert!(
+            should.contains(&json!({"match_phrase": {"prefix": "skills"}})),
+            "{q}"
+        );
+    }
+
+    /// The longest prefix wins, so `rp-2-docs` belongs to `rp-2`, not `rp`.
+    #[test]
+    fn root_of_index_takes_the_longest_prefix() {
+        let runs = vec![
+            run_doc("rp", "/a", "2026-10-30T00:00:00Z"),
+            run_doc("rp-2", "/b", "2026-10-30T00:00:00Z"),
+        ];
+        let roots = folder_roots(&runs, "rp");
+        assert_eq!(root_of_index(&roots, "rp-docs"), Some("/a"));
+        assert_eq!(root_of_index(&roots, "rp-2-docs"), Some("/b"));
+    }
 
     fn limits(stat_cap: u64) -> WalkLimits {
         WalkLimits {

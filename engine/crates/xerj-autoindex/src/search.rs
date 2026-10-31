@@ -205,6 +205,61 @@ pub(crate) fn passage_line(hit: &Value) -> Option<u64> {
     first.get("ordinal").and_then(Value::as_u64).map(|o| o + 1)
 }
 
+/// Every hit's printed location (#2644). When the hits come from two or
+/// more indexed folders, each is led by its folder: `pdf/SKILL.md:3` alone
+/// does not say whether it is the Claude or the Codex copy. Hits from one
+/// folder print as before, however many folders the catalog holds.
+fn hit_locations(
+    hits: &[Value],
+    roots: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    let found: Vec<Option<&str>> = hits
+        .iter()
+        .map(|h| {
+            h.get("_index")
+                .and_then(Value::as_str)
+                .and_then(|index| staleness::root_of_index(roots, index))
+        })
+        .collect();
+    let folders: BTreeSet<&str> = found.iter().flatten().copied().collect();
+    hits.iter()
+        .zip(&found)
+        .map(|(h, root)| {
+            let loc = hit_location(h);
+            match root {
+                Some(root) if folders.len() > 1 => display_join(root, &loc),
+                _ => loc,
+            }
+        })
+        .collect()
+}
+
+/// A stored root as a person would type it. Windows roots are stored in
+/// their `\\?\` form, which most programs will not open.
+pub(crate) fn display_root(root: &str) -> String {
+    if let Some(rest) = root.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = root.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        root.to_string()
+    }
+}
+
+/// `root` joined with a hit's location (`/` separated) in the root's own separator.
+fn display_join(root: &str, loc: &str) -> String {
+    let root = display_root(root);
+    if root.starts_with(r"\\") || root.get(1..3) == Some(r":\") {
+        format!(
+            "{}\\{}",
+            root.trim_end_matches('\\'),
+            loc.replace('/', "\\")
+        )
+    } else {
+        format!("{}/{}", root.trim_end_matches('/'), loc)
+    }
+}
+
 /// Format the header token for a search or definition hit.
 ///
 /// A source line wins (`path:line`). A PDF page or a notebook cell is cited
@@ -1064,6 +1119,10 @@ pub fn run_search_cli() -> i32 {
     // A missing catalog, a remote folder, or a check that hits its cap leaves
     // the response unchanged (#2345).
     let stale = spawn_staleness_check(&url, api_key.as_deref(), &prefix);
+    let folders = {
+        let (url, api_key, prefix) = (url.to_string(), api_key.clone(), prefix.to_string());
+        std::thread::spawn(move || staleness::fetch_folder_roots(&url, api_key.as_deref(), &prefix))
+    };
     let mut resp = match es.search_without_savings(&pattern, &body) {
         Ok(v) => v,
         Err(e) => {
@@ -1114,10 +1173,11 @@ pub fn run_search_cli() -> i32 {
         return exit;
     }
 
-    for h in &hits {
+    let folders = folders.join().ok().flatten().unwrap_or_default();
+    let locations = hit_locations(&hits, &folders);
+    for (h, loc) in hits.iter().zip(locations) {
         let src = h.get("_source").cloned().unwrap_or(Value::Null);
         let score = h.get("_score").and_then(Value::as_f64).unwrap_or(0.0);
-        let loc = hit_location(h);
         let kind = src.get("kind").and_then(Value::as_str).unwrap_or("");
         let tag = if kind.is_empty() {
             String::new()
@@ -1156,6 +1216,57 @@ pub fn run_search_cli() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The folder is printed only when the hits themselves come from two or
+    /// more folders: a catalog that also holds `ax-2` must not lengthen the
+    /// paths of a search whose hits all come from `ax`.
+    #[test]
+    fn hits_from_one_folder_keep_short_paths_beside_other_folders() {
+        let hit = |index: &str, path: &str, line: u64| json!({"_index": index, "_source": {"ax_path": path, "start_line": line}});
+        let mut roots = std::collections::BTreeMap::new();
+        roots.insert("skills-claude".to_string(), "/h/.claude/skills".to_string());
+        roots.insert("skills-codex".to_string(), "/h/.codex/skills".to_string());
+        let one = [
+            hit("skills-codex-docs", "pdf/SKILL.md", 3),
+            hit("skills-codex-docs", "xlsx/SKILL.md", 1),
+        ];
+        assert_eq!(
+            hit_locations(&one, &roots),
+            vec!["pdf/SKILL.md:3", "xlsx/SKILL.md:1"]
+        );
+        // An index no catalog prefix claims keeps its relative path.
+        let two = [
+            hit("skills-codex-docs", "pdf/SKILL.md", 3),
+            hit("skills-claude-docs", "pdf/SKILL.md", 3),
+            hit("skills-docs", "a.md", 1),
+        ];
+        assert_eq!(
+            hit_locations(&two, &roots),
+            vec![
+                "/h/.codex/skills/pdf/SKILL.md:3",
+                "/h/.claude/skills/pdf/SKILL.md:3",
+                "a.md:1"
+            ]
+        );
+    }
+
+    /// A Windows root is stored as `\\?\C:\...`. Joined as is with a
+    /// `/` path it prints a path Windows will not open.
+    #[test]
+    fn a_windows_root_prints_as_a_path_windows_opens() {
+        assert_eq!(
+            display_join(r"\\?\C:\Users\me\.claude\skills", "pdf/SKILL.md:3"),
+            r"C:\Users\me\.claude\skills\pdf\SKILL.md:3"
+        );
+        assert_eq!(
+            display_join(r"\\?\UNC\srv\share\skills", "pdf/SKILL.md:3"),
+            r"\\srv\share\skills\pdf\SKILL.md:3"
+        );
+        assert_eq!(
+            display_join("/h/.claude/skills", "pdf/SKILL.md:3"),
+            "/h/.claude/skills/pdf/SKILL.md:3"
+        );
+    }
 
     /// The CLI's catalog read must overlap the query, not follow it (#2422).
     /// A catalog that answers after 600 ms must not hold up the caller.

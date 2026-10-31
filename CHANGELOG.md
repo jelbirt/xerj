@@ -74,6 +74,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   measured output.
   Part of #2644.
 
+- `xerj autoindex --skills` finds the folders agents keep installed skills
+  in (`.claude/skills`, `.codex/skills` and `.agents/skills` in the home
+  directory, and `.claude/skills` in the current folder), skips the ones that
+  do not exist, and indexes each under its own prefix below one stem
+  (`skills-claude`, `skills-codex`, `skills-agents`, `skills-project`; pick
+  the stem with `--prefix`). `xerj search --prefix skills "<what you want to
+  do>"` searches them all, and when the hits come from several folders each
+  prints its full path. `--watch` watches every folder. One prefix still owns
+  one folder. `xerj init` writes teaching files version 8, which name
+  `--skills`, and the recipe `docs/recipes/find-a-skill.md` uses it. Part of
+  #2644.
+
 ### Fixed
 
 - Code-extraction size skips now report exact file/limit byte counts and

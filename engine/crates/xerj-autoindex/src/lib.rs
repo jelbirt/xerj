@@ -51,6 +51,7 @@ pub mod remove;
 pub mod resources;
 pub mod search;
 pub mod sessions;
+pub mod skills;
 pub mod sniff;
 pub mod source;
 mod stage;
@@ -2551,6 +2552,7 @@ pub fn run_cli() -> i32 {
             return 0;
         }
         Cmd::Index(cfg) => run_index(*cfg),
+        Cmd::Skills(cfg) => skills::run(*cfg),
         Cmd::Map(cfg) => run_map(cfg),
         Cmd::Status(cfg) => run_status(cfg),
         Cmd::Remove(cfg) => run_remove(cfg),
