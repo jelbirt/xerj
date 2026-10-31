@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use regex::Regex;
@@ -78,6 +78,42 @@ fn transient_read_permit(
     }
 }
 
+/// How long a rayon worker polls a segment's stored-decode flight lock
+/// before decoding on its own (#2427).
+const STORED_FLIGHT_WORKER_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// #2427: take a segment's stored-decode single-flight lock (`None`: decode
+/// without it).
+///
+/// The lock is held across a whole stored-section decode, and that decode
+/// fans its columns out on the global rayon pool. A rayon worker that
+/// blocked on the lock could therefore deadlock forever: while it waits in a
+/// `join` it steals a query's hydration job that wants the lock, so the
+/// decode job the holder is waiting for sits beneath a frame that never
+/// returns. A post-ingest node froze in exactly this cycle (a cold-stored
+/// warm held the lock; a query's `hydrate_deferred_cold_sources` job on
+/// `xerj-search-4` waited on it), and every later search touching the
+/// segment hung to the 30 s request deadline. Threads outside the pool keep
+/// the blocking single-flight; a worker polls for a bounded time, then pays
+/// a duplicate decode rather than block.
+fn lock_stored_flight(flight: &std::sync::Mutex<()>) -> Option<std::sync::MutexGuard<'_, ()>> {
+    if rayon::current_thread_index().is_none() {
+        return flight.lock().ok();
+    }
+    let deadline = std::time::Instant::now() + STORED_FLIGHT_WORKER_WAIT;
+    loop {
+        match flight.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(_)) => return None,
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 /// Retained-size bound of a `StoredSlices` built from `raw` (the framing-only
 /// estimator; a zstd frame without a content size falls back to 8x raw).
 fn stored_slices_bound(raw: &[u8], expect_docs: u64) -> u64 {
@@ -89,6 +125,24 @@ fn stored_slices_bound(raw: &[u8], expect_docs: u64) -> u64 {
                 .saturating_mul(8)
                 .saturating_add(expect_docs.saturating_mul(8))
         })
+}
+
+/// #2427: whether a publish-time stored-slices warm whose retained size is
+/// at most `bound` may decode at all: the hydration cache must have room to
+/// keep it, and when the parent RSS watermark is armed (`rss_room` is the
+/// distance to it) keeping it must not carry the node over the watermark.
+fn publish_stored_warm_fits(
+    budget: &SegmentHydrationBudget,
+    bound: u64,
+    rss_room: Option<u64>,
+) -> bool {
+    budget.has_headroom(bound) && rss_room.is_none_or(|room| bound < room)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Publish-time stored-section decodes on this thread (#2427 tests).
+    static PUBLISH_STORED_WARM_DECODES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Wait for a publication test barrier, on the runtime and bounded.
@@ -253,6 +307,45 @@ mod merge_long_effort_tests {
         for v in ["1", "true", "TRUE", " yes ", "on"] {
             assert!(uses(false, Some(v)), "{v}");
         }
+    }
+}
+
+#[cfg(test)]
+mod shared_memtable_source_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// #2427: a document written through the per-document path used to be
+    /// deep-copied twice and both copies kept until the next flush, once in
+    /// the storage memtable and once in the FTS memtable. A late-run heap
+    /// profile of a 1 GB `_bulk` load had these two copies at ~470 MB of
+    /// ~1.75 GB in use. Both memtables now hold the same `Arc`.
+    #[tokio::test]
+    async fn per_doc_write_keeps_one_parsed_source_for_both_memtables_2427() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("body", FieldType::Text))
+            .unwrap();
+        engine.create_index("shared-source-2427", schema).unwrap();
+        let idx = engine.get_index("shared-source-2427").unwrap();
+        idx.abort_background_tasks();
+        idx.index_document(Some("one".into()), json!({"body": "alpha beta"}))
+            .await
+            .unwrap();
+
+        let fts = idx.memtable.get_doc_source_arc("one").unwrap();
+        assert_eq!(fts["body"], "alpha beta");
+        // Owners: the FTS memtable, the storage memtable and `fts` itself.
+        // A private FTS copy would leave only two.
+        assert_eq!(
+            Arc::strong_count(&fts),
+            3,
+            "the FTS memtable must share the storage memtable's source, not deep-copy it"
+        );
     }
 }
 
@@ -2044,6 +2137,74 @@ mod flush_publication_recovery_tests {
         assert_eq!(idx.search(&request).await.unwrap().hits[0].id, "survivor");
     }
 
+    /// #2427: publish-time warming must size a stored-slices warm BEFORE it
+    /// decompresses the section. A merged segment's section decodes to
+    /// hundreds of MB; when the hydration cache has no room the result is
+    /// refused right after the build, so the decode was nothing but a
+    /// transient RSS spike on an ingesting node.
+    ///
+    /// Fails before the fix: the full-budget warm still decodes the section
+    /// once (and the cache then refuses it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_warm_skips_a_stored_decode_the_cache_would_refuse_2427() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::Engine::new(topk_projection_config(dir.path())).unwrap();
+        engine
+            .create_index("publish-warm-fit", topk_projection_schema())
+            .unwrap();
+        let idx = engine.get_index("publish-warm-fit").unwrap();
+        idx.abort_background_tasks();
+        for i in 0..512u64 {
+            idx.index_document(
+                Some(format!("doc-{i}")),
+                json!({"title": format!("title {i}"), "body": format!("body text {i}"), "blob": "x".repeat(64)}),
+            )
+            .await
+            .unwrap();
+        }
+        idx.flush().await.unwrap();
+        let seg = idx.store.snapshot().segments[0].clone();
+        idx.release_memory();
+        assert!(
+            !idx.stored_slices_cache.contains_key(&seg.id),
+            "precondition: cold"
+        );
+        let segments_dir = idx.data_dir.join("segments");
+        let decodes = || PUBLISH_STORED_WARM_DECODES.with(|n| n.get());
+
+        // No room in the cache: the section is not decompressed at all.
+        let mut caches = idx.publish_warm_caches();
+        caches.budget = SegmentHydrationBudget::new(0);
+        let before = decodes();
+        warm_segment_at_publish(&idx.store, &segments_dir, &caches, &seg.id, seg.doc_count);
+        assert_eq!(
+            decodes() - before,
+            0,
+            "a warm the hydration cache would refuse must not decode the stored section"
+        );
+        assert!(!idx.stored_slices_cache.contains_key(&seg.id));
+
+        // Room in the cache: warmed and kept, exactly as before.
+        caches.budget = SegmentHydrationBudget::new(u64::MAX);
+        let before = decodes();
+        warm_segment_at_publish(&idx.store, &segments_dir, &caches, &seg.id, seg.doc_count);
+        assert_eq!(decodes() - before, 1);
+        assert!(idx.stored_slices_cache.contains_key(&seg.id));
+    }
+
+    /// #2427: the RSS side of the publish-warm fit — a warm that would carry
+    /// the node to the parent watermark is skipped even with cache room.
+    #[test]
+    fn publish_stored_warm_fit_respects_cache_room_and_rss_watermark_2427() {
+        let roomy = SegmentHydrationBudget::new(u64::MAX);
+        let full = SegmentHydrationBudget::new(0);
+        assert!(publish_stored_warm_fits(&roomy, 100, None), "watermark off");
+        assert!(publish_stored_warm_fits(&roomy, 100, Some(101)));
+        assert!(!publish_stored_warm_fits(&roomy, 100, Some(100)));
+        assert!(!publish_stored_warm_fits(&roomy, 100, Some(0)));
+        assert!(!publish_stored_warm_fits(&full, 100, None), "no cache room");
+    }
+
     /// #2427/#1122: a stored-slices build the hydration cache cannot hold is
     /// transient, and it must hold a read-budget reservation for as long as a
     /// query holds the value — so concurrent cold queries are bounded by the
@@ -2266,6 +2427,108 @@ mod flush_publication_recovery_tests {
         }
         // Unprojected hits carry the whole source.
         assert!(cold[2].hits.iter().all(|h| h.source["body"].is_string()));
+        drop(idx);
+        drop(engine);
+    }
+
+    /// #2427: a cold query over a many-segment index must not start one
+    /// whole-section stored decode per segment at once. Before the fix every
+    /// cold segment the query hydrated from its winning rows spawned its own
+    /// background warm, all concurrently (54 on the 1 GB gate's pg-docs:
+    /// anon RSS ~1.0 -> ~4.7 GB after the query returned, cap 3 GiB). Now one
+    /// warm per index runs at a time and the rest are skipped, so one query
+    /// warms at most one segment; the answer is unchanged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_query_runs_at_most_one_stored_warm_2427() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::Engine::new(topk_projection_config(dir.path())).unwrap();
+        engine
+            .create_index("warm-bound", topk_projection_schema())
+            .unwrap();
+        let idx = engine.get_index("warm-bound").unwrap();
+        idx.abort_background_tasks();
+        let blob = "0.125 33.9 -118.4 ".repeat(50);
+        for batch in 0..6u64 {
+            for i in 0..400u64 {
+                let n = batch * 400 + i;
+                // Later segments score higher, so every segment holds
+                // candidates for the page and is hydrated from its rows.
+                let body = if n % 7 == 0 {
+                    format!("{}report {n}", "needle ".repeat(batch as usize + 1))
+                } else {
+                    format!("hay stack {n}")
+                };
+                idx.index_document(
+                    Some(format!("doc-{n}")),
+                    json!({"title": format!("title {n}"), "body": body, "blob": blob}),
+                )
+                .await
+                .unwrap();
+            }
+            idx.flush().await.unwrap();
+        }
+        drop(idx);
+        drop(engine);
+
+        let engine = crate::Engine::new(topk_projection_config(dir.path())).unwrap();
+        let idx = engine.get_index("warm-bound").unwrap();
+        idx.abort_background_tasks();
+        let segs: Vec<String> = {
+            let snapshot = idx.store.snapshot();
+            snapshot.segments.iter().map(|s| s.id.to_string()).collect()
+        };
+        assert!(
+            segs.len() >= 4,
+            "precondition: many segments, got {}",
+            segs.len()
+        );
+        let warmed = |idx: &Index| {
+            segs.iter()
+                .filter(|id| {
+                    idx.stored_slices_cache.contains_key(id.as_str())
+                        || idx.decoded_stored_cache.contains_key(id.as_str())
+                })
+                .count()
+        };
+        assert_eq!(warmed(&idx), 0, "precondition: stored caches cold");
+
+        let request = xerj_query::parse_request(&json!({
+            "query": {"match": {"body": "needle"}},
+            "size": 5,
+            "_source": ["title"]
+        }))
+        .unwrap();
+        let cold = idx.search(&request).await.unwrap();
+        assert_eq!(cold.hits.len(), 5);
+        let hydrated = idx.cold_row_hydrations.load(Ordering::Relaxed);
+        assert!(
+            hydrated >= 3,
+            "precondition: the query hydrates several cold segments, got {hydrated}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !idx.cold_stored_warms.is_empty() {
+            assert!(std::time::Instant::now() < deadline, "warm never settled");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // Let any (pre-fix) straggler publish before counting.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // The bound is on warms running at once. A warm that finishes while
+        // the query is still hydrating lets the next cold segment start
+        // one, so the total warmed can exceed one on a fast runner (CI saw
+        // 2 of 6); the number in flight never does.
+        let peak = idx.cold_stored_warm_peak.load(Ordering::Acquire);
+        assert!(
+            peak <= 1,
+            "one cold query ran {peak} stored warms at once over {} segments",
+            segs.len()
+        );
+
+        // The warm answer equals the cold answer.
+        let warm = idx.search(&request).await.unwrap();
+        let ids = |r: &xerj_query::executor::SearchResult| {
+            r.hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&cold), ids(&warm));
         drop(idx);
         drop(engine);
     }
@@ -2572,6 +2835,94 @@ mod flush_publication_recovery_tests {
         assert!(row_projection_keeps_column(&keep, "prefix"));
         assert!(!row_projection_keeps_column(&keep, "metadata"));
         assert!(!row_projection_keeps_column(&keep, "ab"));
+    }
+
+    /// #2427: a rayon worker must not block on a segment's stored-decode
+    /// flight lock. The holder (a cold-stored warm) waits on its own
+    /// rayon-parallel decode, so a worker parked on the lock can sit on top
+    /// of the very job the holder needs: a permanent deadlock that pinned
+    /// every later search of the segment at the 30 s request deadline.
+    /// Threads outside the pool still single-flight.
+    ///
+    /// Fails before the fix: the worker blocks on the held lock, so the
+    /// holder, which waits for the pool before it releases, times out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rayon_worker_never_blocks_on_a_held_stored_flight_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::Engine::new(topk_projection_config(dir.path())).unwrap();
+        engine
+            .create_index("flight-lock", topk_projection_schema())
+            .unwrap();
+        let idx = engine.get_index("flight-lock").unwrap();
+        idx.abort_background_tasks();
+        for i in 0..256u64 {
+            idx.index_document(
+                Some(format!("doc-{i}")),
+                json!({"title": format!("title {i}"), "body": format!("body text {i}")}),
+            )
+            .await
+            .unwrap();
+        }
+        idx.flush().await.unwrap();
+        let seg = idx.store.snapshot().segments[0].clone();
+        idx.release_memory();
+        assert!(
+            !idx.stored_slices_cache.contains_key(&seg.id),
+            "precondition: cold"
+        );
+
+        let flight = Arc::clone(
+            idx.stored_slices_build_locks
+                .entry(seg.id.clone())
+                .or_default()
+                .value(),
+        );
+        let held = flight.lock().unwrap();
+        let roomy = SegmentHydrationBudget::new(u64::MAX);
+        let read = ReadTransientBudget::new(1 << 30, std::time::Duration::from_secs(5));
+        let build = |idx: Arc<Index>,
+                     roomy: Arc<SegmentHydrationBudget>,
+                     read: Arc<ReadTransientBudget>| {
+            let (seg_id, docs) = (seg.id.clone(), seg.doc_count);
+            move || {
+                idx.stored_slices_for_with(&seg_id, docs, &roomy, &read)
+                    .is_some()
+            }
+        };
+
+        // Outside the pool: still single-flight, waits for the holder.
+        let (outside_tx, outside_rx) = std::sync::mpsc::channel();
+        let outside = build(Arc::clone(&idx), Arc::clone(&roomy), Arc::clone(&read));
+        let outside_thread = std::thread::spawn(move || outside_tx.send(outside()).unwrap());
+        assert!(
+            outside_rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .is_err(),
+            "a caller outside the pool keeps the blocking single-flight"
+        );
+
+        // On a rayon worker: the holder waits for the pool, as a warm's
+        // parallel decode does; the worker must decode without the lock.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let (worker_tx, worker_rx) = std::sync::mpsc::channel();
+        let worker = build(Arc::clone(&idx), Arc::clone(&roomy), Arc::clone(&read));
+        pool.spawn(move || worker_tx.send(worker()).unwrap());
+        let worker_result = worker_rx.recv_timeout(std::time::Duration::from_secs(10));
+        drop(held);
+        assert_eq!(
+            worker_result,
+            Ok(true),
+            "a rayon worker must not block on a held stored flight lock"
+        );
+        assert_eq!(
+            outside_rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(true)
+        );
+        outside_thread.join().unwrap();
+        assert!(idx.stored_slices_cache.contains_key(&seg.id));
     }
 
     /// #950: building the id→position map must NOT materialise the full
@@ -5914,9 +6265,8 @@ mod merge_publication_transaction_tests {
     /// stopped.
     ///
     /// Same contract as `hand_driven_index`: the restart half of these tests
-    /// asserts on a recovered segment set, and `Index::open` schedules its
-    /// own open-time merge check too (`request_merge_check`, #871 — an
-    /// opened index may carry pre-existing merge debt).
+    /// asserts on a recovered segment set, and any flush after the reopen
+    /// arms a background merge check (#871).
     fn reopen_hand_driven(dir: &TempDir, name: &str) -> (Engine, Arc<Index>) {
         let engine = Engine::new(config(dir)).unwrap();
         let index = engine.get_index(name).unwrap();
@@ -7021,6 +7371,70 @@ mod merge_publication_transaction_tests {
         }
     }
 
+    async fn seed_segments_for_reopen(dir: &TempDir, name: &str, segments: usize) {
+        let (engine, index) = hand_driven_index(dir, name, Schema::empty());
+        for n in 0..segments {
+            index
+                .index_document(Some(format!("d{n}")), serde_json::json!({"value": n}))
+                .await
+                .unwrap();
+            index.flush().await.unwrap();
+        }
+        assert_eq!(index.store.snapshot().segments.len(), segments);
+        drop(index);
+        drop(engine);
+    }
+
+    /// #2427 — a restarted node that receives no writes runs no catch-up
+    /// merges. In the 1 GB release gate every index on the restarted
+    /// search-only node merged its inherited segments a few seconds after
+    /// boot, while it served reads above the breaker watermark on a
+    /// 3,072 MB cap. On the old code the open-time
+    /// `request_merge_check` evaluates (and merges) within the 5 s
+    /// debounce, so the first assertion fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_reopened_index_without_writes_runs_no_catch_up_merge() {
+        const SEGMENTS: usize = 6;
+        let dir = TempDir::new().unwrap();
+        seed_segments_for_reopen(&dir, "no-catchup", SEGMENTS).await;
+
+        // Background scheduling stays running: it is the subject.
+        let engine = Engine::new(config(&dir)).unwrap();
+        let index = engine.get_index("no-catchup").unwrap();
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            index.merge_evaluation_count(),
+            0,
+            "a reopened index with no writes evaluated a merge"
+        );
+        assert!(!index.is_merge_in_progress());
+        assert_eq!(index.store.snapshot().segments.len(), SEGMENTS);
+        let docs = index
+            .search(&SearchRequest::default())
+            .await
+            .unwrap()
+            .total
+            .value;
+        assert_eq!(docs, SEGMENTS as u64);
+
+        // The first write pays the inherited debt.
+        index
+            .index_document(Some("w".into()), serde_json::json!({"value": "w"}))
+            .await
+            .unwrap();
+        index.flush().await.unwrap();
+        settle_merge_scheduler(&index).await;
+        assert!(index.merge_evaluation_count() >= 1);
+        assert!(
+            index.store.snapshot().segments.len() < SEGMENTS,
+            "the first write did not pay the inherited merge debt"
+        );
+        index.abort_background_tasks();
+    }
+
     /// #871 — merge scheduling must be event-driven: after an index's merge
     /// work settles, ZERO further merge-policy evaluations may run until the
     /// segment set changes again.
@@ -7786,6 +8200,82 @@ mod semantic_deadline_regression_tests {
         .expect("dedicated sync ingest thread panicked")
         .unwrap();
         assert!(sync_idx.passage_chunks_require_exact("body_vector"));
+    }
+
+    /// #2427: a vector-bearing batch goes into the graph through one
+    /// parallel-planned `insert_batch`. Every doc must still get exactly one
+    /// live node, a doc id repeated inside the batch must tombstone its
+    /// earlier node (the per-doc update semantics), and the graph must
+    /// answer exact nearest-neighbour queries.
+    #[tokio::test]
+    async fn batched_hnsw_inserts_keep_per_doc_semantics_2427() {
+        let dir = TempDir::new().unwrap();
+        let engine_instance = engine(&dir);
+        let mut schema = Schema::empty();
+        let mut vector = FieldConfig::new("v", FieldType::Vector);
+        vector.options.dimensions = Some(8);
+        vector.options.similarity = Some("cosine".into());
+        schema.add_field(vector).unwrap();
+        engine_instance
+            .create_index("batched-hnsw", schema)
+            .unwrap();
+        let idx = engine_instance.get_index("batched-hnsw").unwrap();
+
+        let vector_for = |i: usize| -> Vec<f32> {
+            (0..8u64)
+                .map(|d| {
+                    let h = (i as u64 * 8 + d + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    ((h >> 40) % 2001) as f32 / 1000.0 - 1.0
+                })
+                .collect()
+        };
+        let mut docs: Vec<(String, Value)> = (0..1500)
+            .map(|i| {
+                (
+                    format!("doc-{i}"),
+                    serde_json::json!({ "text": "t", "v": vector_for(i) }),
+                )
+            })
+            .collect();
+        // Re-index doc-7 later in the same batch with doc-1234's vector.
+        docs.push((
+            "doc-7".to_string(),
+            serde_json::json!({ "text": "t", "v": vector_for(1234) }),
+        ));
+        idx.index_batch_turbo(docs, true, false).await.unwrap();
+
+        let (graph_len, tombstones) = {
+            let guard = idx.hnsw.read().await;
+            let hnsw = guard.as_ref().expect("graph built");
+            (hnsw.len(), hnsw.tombstone_count())
+        };
+        assert_eq!(graph_len, 1501, "one node per inserted vector");
+        assert_eq!(
+            tombstones, 1,
+            "the in-batch update tombstones doc-7's first node"
+        );
+        let id_map = idx.hnsw_id_map.read().await.clone();
+        let id_rev = idx.hnsw_id_rev.read().await.clone();
+        assert_eq!(id_map.len(), 1500);
+        assert_eq!(id_rev.len(), 1500);
+        for (doc_id, node) in &id_map {
+            assert_eq!(id_rev.get(node), Some(doc_id));
+        }
+        assert_eq!(idx.vector_doc_count.load(Ordering::Relaxed), 1500);
+
+        for probe in [0usize, 333, 999, 1499] {
+            let hits = idx.knn_search(&vector_for(probe), 1).await;
+            assert_eq!(
+                hits.first().map(|h| h.0.as_str()),
+                Some(format!("doc-{probe}").as_str())
+            );
+        }
+        // doc-7 now carries doc-1234's vector; its old vector is gone.
+        let hits = idx.knn_search(&vector_for(1234), 2).await;
+        let ids: HashSet<&str> = hits.iter().map(|h| h.0.as_str()).collect();
+        assert_eq!(ids, HashSet::from(["doc-7", "doc-1234"]));
+        let hits = idx.knn_search(&vector_for(7), 1).await;
+        assert_ne!(hits.first().map(|h| h.0.as_str()), Some("doc-7"));
     }
 
     #[tokio::test]
@@ -10267,6 +10757,10 @@ pub struct Index {
     /// Optional HNSW index for dense-vector KNN search.
     /// Lazily created on first vector document insertion.
     pub hnsw: Arc<RwLock<Option<HnswIndex>>>,
+    /// Last observed `HnswIndex::heap_bytes` (#2427), refreshed under the
+    /// `hnsw` write guard on every insert and reload so the ingest-memory
+    /// sampler can read it without contending for the graph lock.
+    hnsw_heap_bytes: Arc<AtomicUsize>,
     /// Maps string doc-id → u64 node-id used by HNSW.
     hnsw_id_map: Arc<RwLock<HashMap<String, u64>>>,
     /// Maps u64 node-id → string doc-id (reverse of hnsw_id_map).
@@ -10542,8 +11036,17 @@ pub struct Index {
     self_ref: std::sync::OnceLock<std::sync::Weak<Index>>,
     /// Segments with a background stored-slices warm queued or running.
     cold_stored_warms: dashmap::DashMap<String, ()>,
-    /// Background warms skipped because the hydration budget had no room
-    /// for the slices they would build (#2427/#1122).
+    /// #2427: set while a background stored-slices warm runs. At most one
+    /// warm per index decodes at a time (see `schedule_cold_stored_warm`).
+    cold_stored_warm_running: std::sync::atomic::AtomicBool,
+    /// Test-only: the most cold stored warms that ever ran at once (#2427).
+    #[cfg(test)]
+    cold_stored_warm_peak: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    cold_stored_warm_live: std::sync::atomic::AtomicUsize,
+    /// Background warms not started because one was already running for
+    /// this index, or because the hydration budget had no room for the
+    /// slices they would build (#2427/#1122).
     cold_stored_warms_skipped: AtomicU64,
     /// Cold segments answered by row-selective hydration (observability and
     /// tests).
@@ -11178,6 +11681,7 @@ impl Index {
             test_segment_cache_publish_ready_mask: Arc::new(AtomicU64::new(0)),
             enrichments: Arc::new(RwLock::new(HashMap::new())),
             hnsw: Arc::new(RwLock::new(None)),
+            hnsw_heap_bytes: Arc::new(AtomicUsize::new(0)),
             hnsw_id_map: Arc::new(RwLock::new(HashMap::new())),
             hnsw_id_rev: Arc::new(RwLock::new(HashMap::new())),
             hnsw_next_id: Arc::new(AtomicU64::new(1)),
@@ -11250,6 +11754,11 @@ impl Index {
             schema_persist_failures: AtomicU64::new(0),
             self_ref: std::sync::OnceLock::new(),
             cold_stored_warms: dashmap::DashMap::new(),
+            cold_stored_warm_running: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            cold_stored_warm_peak: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            cold_stored_warm_live: std::sync::atomic::AtomicUsize::new(0),
             cold_stored_warms_skipped: AtomicU64::new(0),
             cold_row_hydrations: AtomicU64::new(0),
         });
@@ -11643,6 +12152,9 @@ impl Index {
             schema_hash_cache: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             schema_hash_epoch: Arc::new(AtomicU64::new(0)),
             last_flush_doc_count: Arc::new(AtomicU64::new(0)),
+            hnsw_heap_bytes: Arc::new(AtomicUsize::new(
+                hnsw_init.as_ref().map_or(0, HnswIndex::heap_bytes),
+            )),
             hnsw: Arc::new(RwLock::new(hnsw_init)),
             hnsw_id_map: Arc::new(RwLock::new(id_map_init)),
             hnsw_id_rev: Arc::new(RwLock::new(id_rev_init)),
@@ -11716,6 +12228,11 @@ impl Index {
             schema_persist_failures: AtomicU64::new(0),
             self_ref: std::sync::OnceLock::new(),
             cold_stored_warms: dashmap::DashMap::new(),
+            cold_stored_warm_running: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            cold_stored_warm_peak: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            cold_stored_warm_live: std::sync::atomic::AtomicUsize::new(0),
             cold_stored_warms_skipped: AtomicU64::new(0),
             cold_row_hydrations: AtomicU64::new(0),
         });
@@ -11730,12 +12247,20 @@ impl Index {
                     idx.on_segments_changed();
                 }
             })));
-        // An opened index can carry pre-existing merge debt — a crash
-        // mid-cascade, or merge config lowered since the segments were
-        // written — that no future event would pay off on a read-only
-        // index. Schedule one debounced check now; it quiesces after a
-        // single evaluation when there is nothing to do.
-        index.request_merge_check();
+        // #2427 — no open-time merge check. An opened index can carry
+        // merge debt (a crash mid-cascade, or merge config lowered since
+        // the segments were written). Paying it at open made every index
+        // on a restarted node evaluate (and merge) a few seconds after
+        // boot: in the 1 GB release gate the search-only node, which
+        // received no writes, started merging its inherited segments while
+        // it served reads above the breaker watermark. Merging exists to
+        // bound the segment count that writes create; the debt does not
+        // affect correctness, and the index's first segment-set change
+        // (a flush, a tombstone-only segment, orphan recovery) fires the
+        // segments-changed hook above, which evaluates it then. An
+        // operator who wants it paid on a read-only index runs
+        // `_forcemerge`. This supersedes #2492's open-time quiet period,
+        // which only delayed the same burst by 120 s.
         // RC4 W2 item 17: a flush-time-stale HNSW snapshot used to stay
         // stale for the rest of the process lifetime (ingest kept paying
         // full graph-maintenance cost while the ANN path never served).
@@ -12061,7 +12586,11 @@ impl Index {
             self.collection_publication.handoff_to_readers().await;
             return Err(e.into());
         }
-        let seq_no = match self.store.index(&doc_id, source.clone()) {
+        // One parsed tree, shared by the storage memtable and the FTS
+        // memtable below; each used to hold its own deep copy until the next
+        // flush (#2427).
+        let source = Arc::new(source);
+        let seq_no = match self.store.index_shared(&doc_id, Arc::clone(&source)) {
             Ok(seq_no) => seq_no,
             Err(e) => {
                 collection_publication.cancel();
@@ -12085,7 +12614,12 @@ impl Index {
         {
             let mem = &*self.memtable;
             mem.remove(&doc_id);
-            mem.insert(doc_id.clone(), &source, &schema_guard.schema, seq_no);
+            mem.insert_shared(
+                doc_id.clone(),
+                Arc::clone(&source),
+                &schema_guard.schema,
+                seq_no,
+            );
         }
         drop(schema_guard);
         #[cfg(test)]
@@ -12561,9 +13095,13 @@ impl Index {
                 })
                 .unwrap_or(false)
         }) {
-            for ingest in &processed {
-                self.index_vectors(&ingest.id, &ingest.source).await;
-            }
+            self.index_vectors_batch(
+                processed
+                    .iter()
+                    .map(|ingest| (ingest.id.as_str(), ingest.source.as_ref()))
+                    .collect(),
+            )
+            .await;
         }
 
         // ── Step 5: check flush threshold ─────────────────────────────────
@@ -13015,9 +13553,13 @@ impl Index {
         if let Some((doc, _)) = docs.first() {
             self.publication_test_point(doc, PublicationTestPoint::RawBeforeHnsw);
         }
-        for (doc, source) in docs.iter().zip(&sources) {
-            self.index_vectors(&doc.0, source).await;
-        }
+        self.index_vectors_batch(
+            docs.iter()
+                .zip(&sources)
+                .map(|(doc, source)| (doc.0.as_str(), source.as_ref()))
+                .collect(),
+        )
+        .await;
 
         self.maybe_spawn_flush().await;
 
@@ -13346,11 +13888,14 @@ impl Index {
             #[cfg(test)]
             self.publication_test_point(&vector_sources[0].0, PublicationTestPoint::RawBeforeHnsw);
             let rt = self.flush_signal.runtime().expect("validated above");
-            rt.block_on(async {
-                for (id, source) in vector_sources {
-                    self.index_vectors(&id, &source).await;
-                }
-            });
+            rt.block_on(
+                self.index_vectors_batch(
+                    vector_sources
+                        .iter()
+                        .map(|(id, source)| (id.as_str(), source.as_ref()))
+                        .collect(),
+                ),
+            );
         }
 
         for shard in touched_shards {
@@ -16532,20 +17077,53 @@ impl Index {
     /// node before inserting the fresh vector — otherwise the graph would
     /// keep serving the pre-update vector forever.
     async fn index_vectors(&self, doc_id: &str, source: &Value) {
+        if let Some(vector) = self.graph_vector_for(doc_id, source).await {
+            self.hnsw_insert_vector(doc_id, vector).await;
+        }
+    }
+
+    /// [`index_vectors`](Self::index_vectors) for a whole batch (#2427):
+    /// every doc's SQ8 codes and graph field are handled in order exactly as
+    /// the per-doc path does, but the graph inserts go through one
+    /// [`hnsw_insert_vectors`](Self::hnsw_insert_vectors) call, whose
+    /// construction searches run in parallel. A doc id repeated inside the
+    /// batch flushes the inserts collected so far first, so the later
+    /// version still tombstones the earlier one.
+    ///
+    /// Takes a collected `Vec`, not an iterator: a borrowing iterator held
+    /// across the `.await`s makes the future not provably `Send`.
+    async fn index_vectors_batch(&self, docs: Vec<(&str, &Value)>) {
+        let mut pending: Vec<(String, Vec<f32>)> = Vec::new();
+        let mut pending_ids: HashSet<&str> = HashSet::new();
+        for (doc_id, source) in docs {
+            let Some(vector) = self.graph_vector_for(doc_id, source).await else {
+                continue;
+            };
+            if !pending_ids.insert(doc_id) {
+                self.hnsw_insert_vectors(std::mem::take(&mut pending)).await;
+                pending_ids.clear();
+                pending_ids.insert(doc_id);
+            }
+            pending.push((doc_id.to_string(), vector));
+        }
+        self.hnsw_insert_vectors(pending).await;
+    }
+
+    /// SQ8-ingest one doc and return the vector it contributes to the HNSW
+    /// graph (pinning the graph field on the first vector-bearing doc), or
+    /// `None` when it contributes none.
+    async fn graph_vector_for(&self, doc_id: &str, source: &Value) -> Option<Vec<f32>> {
         // #392: SQ8 code stores are maintained for EVERY scalar8 field on
         // every write, independent of the single field the HNSW graph pins.
         self.sq8_ingest(doc_id, source).await;
         let obj = match source.as_object() {
             Some(o) => o,
-            None => return,
+            None => return None,
         };
         let pinned: Option<String> = self.hnsw_field.read().unwrap().clone();
         if let Some(field) = pinned {
             // Enforced path: only the pinned field ever enters the graph.
-            if let Some(vector) = extract_numeric_vector(source, &field) {
-                self.hnsw_insert_vector(doc_id, vector).await;
-            }
-            return;
+            return extract_numeric_vector(source, &field);
         }
 
         // No pinned field yet. Cheap sync pre-screen: bail before any async
@@ -16566,15 +17144,12 @@ impl Index {
                     .unwrap_or(false)
         });
         if !has_candidate {
-            return;
+            return None;
         }
 
         // First vector-bearing doc: decide the field, then pin it under the
         // write lock (re-checking, so concurrent deciders agree on one).
-        let decided = match self.choose_hnsw_field(source).await {
-            Some(f) => f,
-            None => return,
-        };
+        let decided = self.choose_hnsw_field(source).await?;
         let field = {
             let mut fg = self.hnsw_field.write().unwrap();
             match fg.as_ref() {
@@ -16585,9 +17160,7 @@ impl Index {
                 }
             }
         };
-        if let Some(vector) = extract_numeric_vector(source, &field) {
-            self.hnsw_insert_vector(doc_id, vector).await;
-        }
+        extract_numeric_vector(source, &field)
     }
 
     /// Pick the field the HNSW graph will index, given the first
@@ -16626,54 +17199,134 @@ impl Index {
     /// insert error) — the doc then has no `hnsw_id_map` entry, so the
     /// coverage guard keeps the kNN query path on brute force.
     async fn hnsw_insert_vector(&self, doc_id: &str, vector: Vec<f32>) -> bool {
-        let dim = vector.len();
-        if dim == 0 {
-            return false;
+        self.hnsw_insert_vectors(vec![(doc_id.to_string(), vector)])
+            .await
+            .first()
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Insert several docs' vectors (distinct doc ids) into the HNSW graph
+    /// under one write-guard hold, with the per-doc semantics of
+    /// [`hnsw_insert_vector`](Self::hnsw_insert_vector). Returns, per item,
+    /// whether it went in.
+    ///
+    /// #2427: the graph inserts go through [`HnswIndex::insert_batch`] on the
+    /// ingest pool, which runs the construction searches (the
+    /// `ef_construction` beams — ~a quarter of node CPU in the 1 GB gate) in
+    /// parallel and keeps only the link writes serial. Before, each doc's
+    /// whole insert ran serially on one runtime thread under the graph
+    /// write guard, so a vector-bearing bulk was bounded by one core no
+    /// matter how idle the rest of the machine was, and concurrent bulks
+    /// into one index queued behind each other. Inserts now hold the outer
+    /// guard shared, so concurrent batches also plan in parallel.
+    async fn hnsw_insert_vectors(&self, items: Vec<(String, Vec<f32>)>) -> Vec<bool> {
+        let mut inserted = vec![false; items.len()];
+        if items.iter().all(|(_, vector)| vector.is_empty()) {
+            return inserted;
         }
         // UPDATE staleness fix: a doc_id that already has a node must have
         // that node tombstoned before the fresh vector goes in (fresh
         // node_id; the old node is never unmarked).
-        let old_node: Option<u64> = self.hnsw_id_map.read().await.get(doc_id).copied();
-        if old_node.is_none() {
-            // Item 8: a new vector-bearing doc-id. Counted on ATTEMPT (here),
-            // not on success below: if the insert then fails (dim mismatch /
-            // graph error), `id_map.len()` stays behind `vector_doc_count`,
-            // which holds the coverage gate on brute force — the safe
-            // direction (a doc that isn't in the graph must not be answered
-            // from it). An update (old_node.is_some()) is already counted.
-            self.vector_doc_count.fetch_add(1, Ordering::Relaxed);
-        }
-        let node_id = self.hnsw_next_id.fetch_add(1, Ordering::Relaxed);
-        {
-            let mut hnsw_guard = self.hnsw.write().await;
-            if hnsw_guard.is_none() {
-                let params = HnswParams::new(dim, DistanceMetric::Cosine);
-                *hnsw_guard = Some(HnswIndex::new(params));
+        let old_nodes: Vec<Option<u64>> = {
+            let id_map = self.hnsw_id_map.read().await;
+            items
+                .iter()
+                .map(|(doc_id, _)| id_map.get(doc_id).copied())
+                .collect()
+        };
+        let mut node_ids = Vec::with_capacity(items.len());
+        for ((_, vector), old_node) in items.iter().zip(&old_nodes) {
+            if vector.is_empty() {
+                node_ids.push(None);
+                continue;
             }
-            if let Some(ref hnsw) = *hnsw_guard {
-                if hnsw.params().dim != dim {
-                    // Mismatched dimension — skip (no id_map entry → the
-                    // coverage guard keeps queries on brute force).
-                    return false;
+            if old_node.is_none() {
+                // Item 8: a new vector-bearing doc-id. Counted on ATTEMPT
+                // (here), not on success below: if the insert then fails (dim
+                // mismatch / graph error), `id_map.len()` stays behind
+                // `vector_doc_count`, which holds the coverage gate on brute
+                // force — the safe direction (a doc that isn't in the graph
+                // must not be answered from it). An update (old_node.is_some())
+                // is already counted.
+                self.vector_doc_count.fetch_add(1, Ordering::Relaxed);
+            }
+            node_ids.push(Some(self.hnsw_next_id.fetch_add(1, Ordering::Relaxed)));
+        }
+        let mut items = items;
+        {
+            // Inserts share the outer guard (#2427): `HnswIndex` serializes
+            // its own link writes under its inner lock, so concurrent batches
+            // only overlap in the read-only construction searches. The
+            // exclusive guard is taken once, to create the graph. Save and
+            // the ANN query paths stay fail-closed against a concurrent
+            // insert through the publication guard every vector write holds
+            // (`hnsw_publications_in_flight` / `hnsw_publication_generation`),
+            // not through this lock.
+            let hnsw_guard = {
+                let read = self.hnsw.read().await;
+                if read.is_some() {
+                    read
+                } else {
+                    drop(read);
+                    let mut write = self.hnsw.write().await;
+                    if write.is_none() {
+                        let dim = items
+                            .iter()
+                            .map(|(_, vector)| vector.len())
+                            .find(|&dim| dim > 0)
+                            .unwrap_or(0);
+                        let params = HnswParams::new(dim, DistanceMetric::Cosine);
+                        *write = Some(HnswIndex::new(params));
+                    }
+                    write.downgrade()
                 }
-                if let Some(old) = old_node {
+            };
+            let Some(ref hnsw) = *hnsw_guard else {
+                return inserted;
+            };
+            let dim = hnsw.params().dim;
+            let mut batch = Vec::with_capacity(items.len());
+            for (i, (_, vector)) in items.iter_mut().enumerate() {
+                // Mismatched dimension — skip (no id_map entry → the coverage
+                // guard keeps queries on brute force).
+                let Some(node_id) = node_ids[i] else { continue };
+                if vector.len() != dim {
+                    continue;
+                }
+                if let Some(old) = old_nodes[i] {
                     hnsw.mark_deleted(old);
                 }
-                if let Err(e) = hnsw.insert(node_id, vector) {
-                    warn!(doc_id, error = %e, "HNSW insert failed");
-                    return false;
+                batch.push((node_id, std::mem::take(vector)));
+                inserted[i] = true;
+            }
+            if !batch.is_empty() {
+                let result = crate::ingest_pool().install(|| hnsw.insert_batch(batch));
+                self.hnsw_heap_bytes
+                    .store(hnsw.heap_bytes(), Ordering::Relaxed);
+                if let Err(e) = result {
+                    // Unreachable after the dim filter above; fail safe by
+                    // leaving every item of the batch out of the id maps.
+                    warn!(error = %e, "HNSW batch insert failed");
+                    return vec![false; items.len()];
                 }
             }
         }
         // Update id maps.
         let mut id_map = self.hnsw_id_map.write().await;
         let mut id_rev = self.hnsw_id_rev.write().await;
-        if let Some(old) = old_node {
-            id_rev.remove(&old);
+        for (i, (doc_id, _)) in items.iter().enumerate() {
+            if !inserted[i] {
+                continue;
+            }
+            let node_id = node_ids[i].expect("inserted items have a node id");
+            if let Some(old) = old_nodes[i] {
+                id_rev.remove(&old);
+            }
+            id_map.insert(doc_id.clone(), node_id);
+            id_rev.insert(node_id, doc_id.clone());
         }
-        id_map.insert(doc_id.to_string(), node_id);
-        id_rev.insert(node_id, doc_id.to_string());
-        true
+        inserted
     }
 
     // ── SQ8 ingest-time code stores (#392) ──────────────────────────────
@@ -17492,11 +18145,11 @@ impl Index {
             .max(HNSW_EF_FLOOR);
 
         // LOCK DISCIPLINE: hold the graph read guard only for the sync
-        // sub-ms beam search and copy the results out — index_vectors takes
-        // `hnsw.write().await` per ingested doc, so holding this guard
-        // across the doc-fetch awaits below would head-of-line-block vector
-        // ingest (and, via writer preference, subsequent readers): exactly
-        // the mixed-read-under-write failure class.
+        // sub-ms beam search and copy the results out — graph creation and
+        // snapshot load take `hnsw.write().await`, so holding this guard
+        // across the doc-fetch awaits below would head-of-line-block them
+        // (and, via writer preference, every later reader and vector
+        // insert): exactly the mixed-read-under-write failure class.
         let raw: Vec<(u64, f32)> = {
             let hnsw_guard = self.hnsw.read().await;
             let hnsw = hnsw_guard.as_ref()?;
@@ -18166,9 +18819,18 @@ impl Index {
     /// answered it from its winning rows (#2422/#2423). Later queries with
     /// other winners then read the warm cache instead of each paying a
     /// projected decode, and the query that found the segment cold no longer
-    /// waits for the whole-section decompress. One warm per segment at a
-    /// time; `stored_slices_for` keeps its single-flight, budget and
-    /// retirement rules.
+    /// waits for the whole-section decompress. `stored_slices_for` keeps its
+    /// single-flight, budget and retirement rules.
+    ///
+    /// #2427: at most ONE warm per index runs at a time, and a warm whose
+    /// decoded section cannot fit the hydration budget is not started. Each
+    /// warm is a full stored-section decompress plus brace walk; a cold query
+    /// over a many-segment index used to spawn one per segment at once (54 on
+    /// the 1 GB gate's pg-docs), which drove the node from ~1 GB to ~4.7 GB
+    /// anon RSS *after* the query returned, against a 3 GiB cap, and most of
+    /// the decoded sections were then refused by the budget at publish and
+    /// thrown away. A skipped warm costs nothing: the query that triggered it
+    /// already has its rows, and a later cold visit schedules it again.
     fn schedule_cold_stored_warm(&self, segment_id: &str, doc_count: u64) {
         let Some(index) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
             return;
@@ -18186,8 +18848,25 @@ impl Index {
         {
             return;
         }
+        if self
+            .cold_stored_warm_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.cold_stored_warms.remove(segment_id);
+            self.cold_stored_warms_skipped
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let segment_id = segment_id.to_string();
         runtime.spawn_blocking(move || {
+            #[cfg(test)]
+            {
+                let live = index.cold_stored_warm_live.fetch_add(1, Ordering::AcqRel) + 1;
+                index
+                    .cold_stored_warm_peak
+                    .fetch_max(live, Ordering::AcqRel);
+            }
             // #2427/#1122: a warm exists to leave the slices cached. When the
             // hydration budget has no room for them the cache would refuse
             // the result, so the warm would only decompress a whole stored
@@ -18204,6 +18883,11 @@ impl Index {
                 let _ = index.stored_slices_for(&segment_id, doc_count);
             }
             index.cold_stored_warms.remove(segment_id.as_str());
+            #[cfg(test)]
+            index.cold_stored_warm_live.fetch_sub(1, Ordering::AcqRel);
+            index
+                .cold_stored_warm_running
+                .store(false, Ordering::Release);
         });
     }
 
@@ -21024,7 +21708,9 @@ impl Index {
         self.hnsw_stale
             .store(stale, std::sync::atomic::Ordering::Release);
         let nodes = loaded.graph.len();
+        let graph_bytes = loaded.graph.heap_bytes();
         *self.hnsw.write().await = Some(loaded.graph);
+        self.hnsw_heap_bytes.store(graph_bytes, Ordering::Relaxed);
         info!(
             nodes,
             stale, "HNSW reloaded from disk — skipping WAL replay rebuild"
@@ -22149,7 +22835,7 @@ impl Index {
                             .or_default();
                         std::sync::Arc::clone(entry.value())
                     };
-                    let _flight_guard = flight.lock().ok();
+                    let _flight_guard = lock_stored_flight(&flight);
                     // Re-check under the flight lock — another thread may
                     // have decoded and published while we waited.
                     let rechecked: Option<Vec<u8>> = self
@@ -27149,7 +27835,7 @@ impl Index {
                                 .or_default();
                             Arc::clone(entry.value())
                         };
-                        let _flight_guard = flight.lock().ok();
+                        let _flight_guard = lock_stored_flight(&flight);
                         // Re-check both caches now that we hold this
                         // segment's flight lock — another thread may have
                         // decoded and published while we waited.
@@ -28475,6 +29161,25 @@ impl Index {
 
     /// Flush the memtable to a new segment on disk, then build the FTS index.
     pub async fn flush(self: &Arc<Self>) -> Result<()> {
+        self.flush_with(FlushFanout::Parallel).await
+    }
+
+    /// [`Self::flush`] with one shard building at a time (#2427).
+    ///
+    /// A shard flush parses the drained documents, builds columns, postings
+    /// and the stored blocks, and none of that working set is charged to the
+    /// memtable budget. The parallel flush builds every non-empty shard at
+    /// once (bounded only by the finalize gate), so a breaker drain on a
+    /// 1,536 MB-capped node took RSS from 1,460 MB to 2,323 MB in about a
+    /// second while four shards built together. A memory-release caller
+    /// wants the peak bounded more than it wants the drain short: each
+    /// shard's segment publishes and its working set is freed before the
+    /// next shard starts.
+    pub async fn flush_one_shard_at_a_time(self: &Arc<Self>) -> Result<()> {
+        self.flush_with(FlushFanout::Serial).await
+    }
+
+    async fn flush_with(self: &Arc<Self>, fanout: FlushFanout) -> Result<()> {
         // #873: this flush is about to take whatever the memtable holds, so
         // every idle-probe observation about it is stale from here on. Clear
         // the pair at the ONE coordinator every flush path runs through
@@ -28538,6 +29243,7 @@ impl Index {
         // coordinator is not aborted (#1015).
         let coordinator = tokio::spawn(async move {
             let mut shard_futures = Vec::with_capacity(n_shards);
+            let mut result: Result<()> = Ok(());
             for shard_idx in 0..n_shards {
                 // #1226 — do not fan a finalize out for an EMPTY shard.
                 //
@@ -28571,7 +29277,9 @@ impl Index {
                 let shard_index_name = coordinator_name.clone();
                 #[cfg(test)]
                 let test_hook = flush_test_hook.clone();
-                shard_futures.push(tokio::spawn(async move {
+                let shard_task = tokio::spawn(async move {
+                    #[cfg(test)]
+                    let _in_flight = FlushShardProbe::enter(&shard_index_name).await;
                     let permit = match wait_for_flush_permit(
                         &shard_index_name,
                         "the flush semaphore",
@@ -28613,19 +29321,14 @@ impl Index {
                         let _ = guard.take();
                     }
                     result
-                }));
-            }
-            let mut result: Result<()> = Ok(());
-            for fut in shard_futures {
-                match fut.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => result = Err(e),
-                    Err(error) => {
-                        result = Err(EngineError::Common(xerj_common::XerjError::internal(
-                            format!("flush shard task failed: {error}"),
-                        )));
-                    }
+                });
+                match fanout {
+                    FlushFanout::Parallel => shard_futures.push(shard_task),
+                    FlushFanout::Serial => fold_shard_flush(&mut result, shard_task.await),
                 }
+            }
+            for fut in shard_futures {
+                fold_shard_flush(&mut result, fut.await);
             }
             // Publication completion must invalidate results even when the
             // request that initiated the flush was cancelled. The coordinator
@@ -28731,6 +29434,17 @@ impl Index {
 
     pub fn memtable_bytes(&self) -> usize {
         self.memtable.size_bytes()
+    }
+
+    /// Estimated heap held by this index's in-memory HNSW graph (#2427).
+    /// Lock-free: reads the value cached on the last insert/reload.
+    pub fn vector_graph_bytes(&self) -> usize {
+        self.hnsw_heap_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Estimated heap held by this index's document version map (#2427).
+    pub fn version_map_bytes(&self) -> usize {
+        self.store.version_map.heap_bytes()
     }
 
     /// Retained JSON-heap estimate of every live memtable source. Test-only
@@ -29117,17 +29831,21 @@ impl Index {
     }
 
     /// Reserve headroom for the token spike of `docs` before they are parsed
-    /// (#1122). See [`crate::governor::analyze_reserve_bytes`]. No governor
-    /// reserves nothing, so an `Index` built directly in a unit test is unchanged.
+    /// (#1122). See [`crate::governor::analyze_reserve_bytes_for_doc`]. No
+    /// governor reserves nothing, so an `Index` built directly in a unit test
+    /// is unchanged.
     fn reserve_batch_analyze(
         docs: &[xerj_storage::RawJsonDoc],
     ) -> Result<crate::governor::AnalyzeReservation> {
         let Some(governor) = crate::governor::global() else {
             return Ok(crate::governor::AnalyzeReservation::none());
         };
-        let raw = docs.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+        let reserve = docs
+            .iter()
+            .map(|(_, bytes)| crate::governor::analyze_reserve_bytes_for_doc(bytes))
+            .fold(0u64, u64::saturating_add);
         governor
-            .reserve_analyze(crate::governor::analyze_reserve_bytes(raw))
+            .reserve_analyze(reserve)
             .map_err(EngineError::Common)
     }
 
@@ -35161,7 +35879,7 @@ impl Index {
                 .or_default();
             Arc::clone(entry.value())
         };
-        let _flight_guard = flight.lock().ok()?;
+        let _flight_guard = lock_stored_flight(&flight);
         if let Some(entry) = self.stored_slices_cache.get(seg_id) {
             return Some(Arc::clone(entry.value()));
         }
@@ -36451,6 +37169,79 @@ struct FlushPublisherTestHook {
 #[cfg(test)]
 tokio::task_local! {
     static FLUSH_PUBLISHER_TEST_HOOK: FlushPublisherTestHook;
+}
+
+/// How [`Index::flush_with`] runs its shard flushes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FlushFanout {
+    /// Every non-empty shard at once (M5.15): the shortest flush.
+    Parallel,
+    /// One shard after another: the smallest uncharged working set (#2427).
+    Serial,
+}
+
+/// Keep the last shard error, as the parallel join always has.
+fn fold_shard_flush(
+    result: &mut Result<()>,
+    joined: std::result::Result<Result<()>, tokio::task::JoinError>,
+) {
+    match joined {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => *result = Err(e),
+        Err(error) => {
+            *result = Err(EngineError::Common(xerj_common::XerjError::internal(
+                format!("flush shard task failed: {error}"),
+            )));
+        }
+    }
+}
+
+/// Test-only count of shard-flush tasks in flight per index, with the peak.
+#[cfg(test)]
+static FLUSH_SHARD_PROBE: std::sync::LazyLock<
+    dashmap::DashMap<
+        String,
+        (
+            Arc<std::sync::atomic::AtomicUsize>,
+            Arc<std::sync::atomic::AtomicUsize>,
+        ),
+    >,
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
+#[cfg(test)]
+pub(crate) struct FlushShardProbe(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(test)]
+impl FlushShardProbe {
+    /// Count this shard task in, then yield so sibling tasks of a parallel
+    /// flush get scheduled while it is still counted.
+    async fn enter(index: &str) -> Self {
+        use std::sync::atomic::Ordering;
+        let (in_flight, peak) = FLUSH_SHARD_PROBE
+            .entry(index.to_string())
+            .or_default()
+            .value()
+            .clone();
+        let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        peak.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        FlushShardProbe(in_flight)
+    }
+
+    /// Peak shard-flush tasks in flight at once for `index` so far.
+    pub(crate) fn peak(index: &str) -> usize {
+        FLUSH_SHARD_PROBE
+            .get(index)
+            .map(|e| e.value().1.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+impl Drop for FlushShardProbe {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 // This deliberately remains a free function so background tasks can own every
@@ -46671,9 +47462,11 @@ fn check_buildable_query(
 /// only in an unsearchable field still matches when no field is named at all.
 /// `query_string {"query": "…"}` and a `more_like_this` with no `fields` both
 /// still return the document — and so does a *wildcard* spec in
-/// `query_string` / `simple_query_string`, because `fields: ["*"]` lowers to
-/// that same field-less `"*"` placeholder rather than to an expansion over the
-/// searchable fields. Measured, not assumed. That divergence from the FTS
+/// `query_string`, because `fields: ["*"]` lowers to that same field-less
+/// `"*"` placeholder rather than to an expansion over the searchable fields.
+/// (`simple_query_string` `["*"]` now lowers like an absent `fields` (#2427),
+/// so a flushed segment answers it from the FTS projection, which applies the
+/// searchable-field rule; only memtable documents still see the scan arm.) Measured, not assumed. That divergence from the FTS
 /// projection predates this change and is called out in its own comment in
 /// `doc_matches_query`; making it schema-aware means threading a schema
 /// through ~79 call sites and is left as its own change.
@@ -54585,7 +55378,10 @@ fn warm_segment_at_publish(
     // the worst moment (the breaker only rejects; it cannot reclaim what
     // warming keeps re-adding). Skip when engaged — the next read
     // re-hydrates on demand, and warming resumes once memory frees up.
-    if crate::governor::global().is_some_and(|g| g.memory_breaker_engaged()) {
+    // #2427: also skip above the breaker's release level, so warming does
+    // not push a still-ingesting node back over the watermark
+    // (`ResourceGovernor::publish_warm_allowed`).
+    if crate::governor::global().is_some_and(|g| !g.publish_warm_allowed()) {
         return;
     }
     // 1. Stored slices.
@@ -54593,6 +55389,25 @@ fn warm_segment_at_publish(
         let built: Option<StoredSlices> = (|| {
             let reader = store.open_segment_arc(seg_id).ok()?;
             let raw = reader.section(SectionType::Stored).ok()??;
+            // #2427: size the warm BEFORE decompressing. A merged segment's
+            // stored section decodes to hundreds of MB (332 MB live in one
+            // late-ingest heap profile of the 1 GB gate) plus the column
+            // materialisation on top while it runs. When the hydration cache
+            // has no room the result is refused right after it is built, so
+            // the whole decode was a pure transient spike; and when the node
+            // is already within that many bytes of the RSS watermark, keeping
+            // it trips the parent breaker on the next sample. Either way the
+            // first query re-hydrates on demand (the pre-warm status quo).
+            let bound = stored_slices_bound(raw, expect_docs);
+            let rss_room = crate::governor::global().and_then(|g| {
+                let watermark = g.memory_watermark_bytes();
+                (watermark > 0).then(|| watermark.saturating_sub(g.observed_rss_bytes()))
+            });
+            if !publish_stored_warm_fits(&caches.budget, bound, rss_room) {
+                return None;
+            }
+            #[cfg(test)]
+            PUBLISH_STORED_WARM_DECODES.with(|n| n.set(n.get() + 1));
             let bytes = xerj_storage::stored_codec::decode_stored(raw).ok()?;
             if bytes.len() > u32::MAX as usize {
                 return None;
@@ -66118,5 +66933,100 @@ mod log_match_operator_tests {
             !hit_ids(&plain.search(&phrase).await.unwrap()).contains(&"is-only".to_string()),
             "the english analyzer already drops is, on a non-log index too"
         );
+    }
+}
+
+#[cfg(test)]
+mod sqs_wildcard_fields_2427_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// #2427 (raw-surface p95 ≈ 30 s on the 1 GB gate):
+    /// `simple_query_string {"fields": ["*"]}` must be answered from the
+    /// inverted index, exactly like the same query with no `fields` at all.
+    ///
+    /// FAIL-BEFORE (watched): on `main` the parser lowered `["*"]` to
+    /// `Match { field: "*" }`, which has no FTS projection, so every flushed
+    /// segment was answered by parsing its stored section — this test saw
+    /// `fts=0 stored_scans=8` (same 200 hits) — and on the gate corpus that walk is what ran
+    /// into the 30 s request deadline. The hit set is asserted too, so the
+    /// faster route cannot quietly change the answer.
+    #[tokio::test]
+    async fn wildcard_fields_simple_query_string_uses_the_inverted_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("title", FieldType::Text))
+            .unwrap();
+        schema
+            .add_field(FieldConfig::new("body", FieldType::Text))
+            .unwrap();
+        engine.create_index("sqs2427", schema).unwrap();
+        let idx = engine.get_index("sqs2427").unwrap();
+
+        // Two segments: the term lives in `title` in one and in `body` in the
+        // other, so a projection onto a single field would under-match.
+        for i in 0..300 {
+            let (title, body) = match i % 3 {
+                0 => ("raft leader", "nothing here"),
+                1 => ("unrelated", "the raft election timed out"),
+                _ => ("unrelated", "nothing here"),
+            };
+            idx.index_document(
+                Some(format!("a{i}")),
+                json!({ "title": title, "body": body }),
+            )
+            .await
+            .unwrap();
+            if i == 149 {
+                idx.flush().await.unwrap();
+            }
+        }
+        idx.flush().await.unwrap();
+
+        let run = |q: serde_json::Value| {
+            let idx = idx.clone();
+            async move {
+                SEG_FTS_HANDLED.with(|c| c.set(0));
+                SEG_STORED_SCANS.with(|c| c.set(0));
+                let req = xerj_query::parse_request(&json!({
+                    "size": 5, "track_total_hits": true, "query": q
+                }))
+                .unwrap();
+                let res = idx.search(&req).await.unwrap();
+                let fts = SEG_FTS_HANDLED.with(|c| c.get());
+                let scans = SEG_STORED_SCANS.with(|c| c.get());
+                (res.total.value, fts, scans)
+            }
+        };
+
+        let (total_star, fts, scans) = run(json!({"simple_query_string": {
+            "query": "raft", "fields": ["*"], "lenient": true
+        }}))
+        .await;
+        assert_eq!(
+            total_star, 200,
+            "every document with `raft` in title OR body must match"
+        );
+        assert!(
+            fts > 0 && scans == 0,
+            "#2427: `fields: [\"*\"]` must be served by the FTS path on every \
+             segment, not by the stored-section scan: fts={fts} stored_scans={scans}"
+        );
+
+        // Same answer as the field-less spelling ES treats it as.
+        let (total_none, _, _) = run(json!({"simple_query_string": {"query": "raft"}})).await;
+        assert_eq!(total_star, total_none);
+
+        // Multi-token, the gate's raw-surface shape.
+        let (total_multi, fts, scans) = run(json!({"simple_query_string": {
+            "query": "leader election", "fields": ["*"], "lenient": true
+        }}))
+        .await;
+        assert_eq!(total_multi, 200);
+        assert!(fts > 0 && scans == 0, "fts={fts} stored_scans={scans}");
     }
 }
