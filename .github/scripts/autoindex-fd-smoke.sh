@@ -4,8 +4,10 @@
 #   1. the "Too many open files" (EMFILE) crash — described below;
 #   2. #482, the `--no-graph` ERROR_ACCESS_DENIED abort on Windows — described
 #      at its own section further down.
+#   3. #2644, `xerj autoindex --skills` finding skill folders under HOME or
+#      USERPROFILE, at its own section near the end.
 #
-# Both exist because nothing in CI used to RUN the binary on macOS/Windows.
+# All three exist because nothing in CI used to RUN the binary on macOS/Windows.
 #
 # The crash: `xerj autoindex` on a large repo infers hundreds of datasets =>
 # hundreds of indices. Before the fix each index pinned one WAL file descriptor
@@ -189,10 +191,66 @@ if [ "${NG_CREATED:-0}" -lt 1 ]; then
   FAIL=1
 fi
 
+# ── `xerj autoindex --skills` finds skill folders on this platform (#2644) ──
+# The skill folders are found under HOME, else USERPROFILE (Windows). A fake
+# home holds two of the folders `--skills` looks for (`.claude/skills`,
+# `.agents/skills`); `.codex/skills` is left missing on purpose, and the run
+# starts in an empty folder so no project `.claude/skills` is found. Both
+# folders must be indexed, a search must find a skill, and the missing folder
+# must not be mentioned at all.
+SK_HOME="$ROOT/skills-home"
+SK_CWD="$ROOT/skills-cwd"
+mkdir -p "$SK_HOME/.claude/skills/kiln-log" "$SK_HOME/.agents/skills/tide-chart" "$SK_CWD"
+printf -- '---\nname: kiln-log\ndescription: Record pottery kiln firings and their temperatures.\n---\n\n# Kiln log\n\nWrite one line per firing with the cone reached.\n' \
+  > "$SK_HOME/.claude/skills/kiln-log/SKILL.md"
+printf -- '---\nname: tide-chart\ndescription: Read a harbour tide chart before a boat launch.\n---\n\n# Tide chart\n\nFind the next high water for the harbour.\n' \
+  > "$SK_HOME/.agents/skills/tide-chart/SKILL.md"
+# On Windows (git-bash and MSYS, where cygpath exists) HOME is emptied so the
+# run takes the folder from USERPROFILE as a Windows path, the way a program
+# started from PowerShell or cmd, where HOME is usually unset, finds it.
+SK_HOME_VAR="$SK_HOME"
+SK_PROFILE="$SK_HOME"
+if command -v cygpath >/dev/null 2>&1; then
+  SK_HOME_VAR=""
+  SK_PROFILE="$(cygpath -w "$SK_HOME")"
+fi
+BIN_ABS="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
+(cd "$SK_CWD" && HOME="$SK_HOME_VAR" USERPROFILE="$SK_PROFILE" \
+  "$BIN_ABS" autoindex --skills --max-minutes 0) > "$DATA/skills.log" 2>&1
+SKRC=$?
+echo "autoindex --skills exit=$SKRC"
+tail -20 "$DATA/skills.log" || true
+if [ "$SKRC" != "0" ] && [ "$SKRC" != "3" ]; then
+  echo "::error::autoindex --skills exited $SKRC (expected 0 or 3) on $(uname -s)"
+  FAIL=1
+fi
+for want in claude agents; do
+  if ! curl -s 'localhost:9200/_cat/indices?h=index' 2>/dev/null | grep -qE "(^|[[:space:]])skills-$want-"; then
+    echo "::error::--skills created no skills-$want-* index on $(uname -s)"
+    FAIL=1
+  fi
+done
+if grep -q '\.codex' "$DATA/skills.log"; then
+  echo "::error::--skills mentioned the missing .codex/skills folder on $(uname -s)"
+  FAIL=1
+fi
+# One search per folder; each query shares words with one skill only.
+for pair in "kiln-log|pottery kiln firing temperatures" "tide-chart|harbour tide chart boat launch"; do
+  skill="${pair%%|*}"
+  "$BIN_ABS" search --prefix skills "${pair#*|}" > "$DATA/skills-search.log" 2>&1
+  if ! grep -qE "$skill[/\\\\]SKILL\.md" "$DATA/skills-search.log"; then
+    echo "::error::a --skills search did not find $skill/SKILL.md on $(uname -s)"
+    cat "$DATA/skills-search.log"
+    FAIL=1
+  else
+    echo "--skills search found $skill/SKILL.md"
+  fi
+done
+
 kill "$SPID" 2>/dev/null || true
 if [ "$FAIL" = 0 ]; then
   echo "AUTOINDEX SMOKE PASSED on $(uname -s) ($CREATED datasets, no EMFILE; \
---no-graph sealed and reconciled, no ACCESS_DENIED)"
+--no-graph sealed and reconciled, no ACCESS_DENIED; --skills found 2 folders)"
 else
   echo "AUTOINDEX SMOKE FAILED on $(uname -s)"
   exit 1
